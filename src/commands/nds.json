@@ -1,0 +1,9 @@
+{
+    "NDS": {
+        "summary": "Naive Data Store commands",
+        "complexity": "Depends on subcommand.",
+        "group": "server",
+        "since": "2.6.0",
+        "arity": -2
+    }
+}

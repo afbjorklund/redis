@@ -1703,6 +1703,12 @@ void zaddGenericCommand(client *c, int flags) {
     /* After the options, we expect to have an even number of args, since
      * we expect any number of score-element pairs. */
     elements = c->argc-scoreidx;
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if (elements % 2 || !elements) {
         addReplyErrorObject(c,shared.syntaxerr);
         return;
@@ -1803,6 +1809,11 @@ void zremCommand(client *c) {
     robj *zobj;
     int deleted = 0, keyremoved = 0, j;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if ((zobj = lookupKeyWriteOrReply(c,key,shared.czero)) == NULL ||
         checkType(c,zobj,OBJ_ZSET)) return;
 
@@ -1842,6 +1853,11 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
     zlexrangespec lexrange;
     long start, end, llen;
     char *notify_type = NULL;
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
 
     /* Step 1: Parse the range. */
     if (rangetype == ZRANGE_RANK) {
@@ -2540,6 +2556,13 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
     int withscores = 0;
     unsigned long cardinality = 0;
     long limit = 0; /* Stop searching after reaching the limit. 0 means unlimited. */
+
+    for (j = 1; j < c->argc; j++) {
+        if (validKey(c->argv[j]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
+    }
 
     /* expect setnum input keys to be given */
     if ((getLongFromObjectOrReply(c, c->argv[numkeysIndex], &setnum, NULL) != C_OK))
@@ -3280,6 +3303,11 @@ void zcountCommand(client *c) {
     zrangespec range;
     unsigned long count = 0;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     /* Parse the range arguments */
     if (zslParseRange(c->argv[2],c->argv[3],&range) != C_OK) {
         addReplyError(c,"min or max is not a float");
@@ -3576,6 +3604,11 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
     int minidx = argc_start + 1;
     int maxidx = argc_start + 2;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     /* Options common to all */
     long opt_start = 0;
     long opt_end = 0;
@@ -3717,6 +3750,11 @@ void zcardCommand(client *c) {
     robj *key = c->argv[1];
     robj *zobj;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if ((zobj = lookupKeyReadOrReply(c,key,shared.czero)) == NULL ||
         checkType(c,zobj,OBJ_ZSET)) return;
 
@@ -3727,6 +3765,11 @@ void zscoreCommand(client *c) {
     robj *key = c->argv[1];
     robj *zobj;
     double score;
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
 
     if ((zobj = lookupKeyReadOrReply(c,key,shared.null[c->resp])) == NULL ||
         checkType(c,zobj,OBJ_ZSET)) return;
@@ -3761,6 +3804,11 @@ void zrankGenericCommand(client *c, int reverse) {
     robj *ele = c->argv[2];
     robj *zobj;
     long rank;
+
+    if (validKey(c->argv[1]) == C_ERR || validKey(c->argv[2]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
 
     if ((zobj = lookupKeyReadOrReply(c,key,shared.null[c->resp])) == NULL ||
         checkType(c,zobj,OBJ_ZSET)) return;

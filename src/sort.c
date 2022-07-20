@@ -280,6 +280,11 @@ void sortCommandGeneric(client *c, int readonly) {
         return;
     }
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     /* Lookup the key to sort. It must be of the right types */
     sortval = lookupKeyRead(c->db, c->argv[1]);
     if (sortval && sortval->type != OBJ_SET &&

@@ -236,6 +236,11 @@ int listTypeDelRange(robj *subject, long start, long count) {
 void pushGenericCommand(client *c, int where, int xx) {
     int j;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     robj *lobj = lookupKeyWrite(c->db, c->argv[1]);
     if (checkType(c,lobj,OBJ_LIST)) return;
     if (!lobj) {
@@ -290,6 +295,11 @@ void linsertCommand(client *c) {
     listTypeEntry entry;
     int inserted = 0;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if (strcasecmp(c->argv[2]->ptr,"after") == 0) {
         where = LIST_TAIL;
     } else if (strcasecmp(c->argv[2]->ptr,"before") == 0) {
@@ -329,6 +339,11 @@ void linsertCommand(client *c) {
 
 /* LLEN <key> */
 void llenCommand(client *c) {
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     robj *o = lookupKeyReadOrReply(c,c->argv[1],shared.czero);
     if (o == NULL || checkType(c,o,OBJ_LIST)) return;
     addReplyLongLong(c,listTypeLength(o));
@@ -336,6 +351,11 @@ void llenCommand(client *c) {
 
 /* LINDEX <key> <index> */
 void lindexCommand(client *c) {
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     robj *o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp]);
     if (o == NULL || checkType(c,o,OBJ_LIST)) return;
     long index;
@@ -363,6 +383,11 @@ void lindexCommand(client *c) {
 
 /* LSET <key> <index> <element> */
 void lsetCommand(client *c) {
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     robj *o = lookupKeyWriteOrReply(c,c->argv[1],shared.nokeyerr);
     if (o == NULL || checkType(c,o,OBJ_LIST)) return;
     long index;
@@ -491,6 +516,11 @@ void popGenericCommand(client *c, int where) {
     long count = 0;
     robj *value;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if (c->argc > 3) {
         addReplyErrorArity(c);
         return;
@@ -589,6 +619,11 @@ void lrangeCommand(client *c) {
     robj *o;
     long start, end;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if ((getLongFromObjectOrReply(c, c->argv[2], &start, NULL) != C_OK) ||
         (getLongFromObjectOrReply(c, c->argv[3], &end, NULL) != C_OK)) return;
 
@@ -602,6 +637,11 @@ void lrangeCommand(client *c) {
 void ltrimCommand(client *c) {
     robj *o;
     long start, end, llen, ltrim, rtrim;
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
 
     if ((getLongFromObjectOrReply(c, c->argv[2], &start, NULL) != C_OK) ||
         (getLongFromObjectOrReply(c, c->argv[3], &end, NULL) != C_OK)) return;
@@ -763,6 +803,11 @@ void lremCommand(client *c) {
     long toremove;
     long removed = 0;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if ((getLongFromObjectOrReply(c, c->argv[2], &toremove, NULL) != C_OK))
         return;
 
@@ -843,6 +888,11 @@ robj *getStringObjectFromListPosition(int position) {
 
 void lmoveGenericCommand(client *c, int wherefrom, int whereto) {
     robj *sobj, *value;
+    if (validKey(c->argv[1]) == C_ERR || validKey(c->argv[2]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if ((sobj = lookupKeyWriteOrReply(c,c->argv[1],shared.null[c->resp]))
         == NULL || checkType(c,sobj,OBJ_LIST)) return;
 
@@ -1032,6 +1082,13 @@ void blockingPopGenericCommand(client *c, robj **keys, int numkeys, int where, i
     robj *key;
     mstime_t timeout;
     int j;
+
+    for (j = 1; j < c->argc-1; j++) {
+        if (validKey(c->argv[j]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
+    }
 
     if (getTimeoutFromObjectOrReply(c,c->argv[timeout_idx],&timeout,UNIT_SECONDS)
         != C_OK) return;

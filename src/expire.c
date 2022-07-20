@@ -31,6 +31,7 @@
  */
 
 #include "server.h"
+#include "nds.h"
 
 /*-----------------------------------------------------------------------------
  * Incremental collection of expired keys.
@@ -559,6 +560,11 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
     long long current_expire = -1;
     int flag = 0;
 
+    if (validKey(key) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     /* checking optional flags */
     if (parseExtendedExpireArgumentsOrReply(c, &flag) != C_OK) {
         return;
@@ -686,10 +692,20 @@ void pexpireatCommand(client *c) {
 void ttlGenericCommand(client *c, int output_ms, int output_abs) {
     long long expire, ttl = -1;
 
+    if (validKey(c->argv[1])) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     /* If the key does not exist at all, return -2 */
     if (lookupKeyReadWithFlags(c->db,c->argv[1],LOOKUP_NOTOUCH) == NULL) {
         addReplyLongLong(c,-2);
         return;
+    }
+
+    if (server.nds) {
+        /* Key needs to be in memory to get TTL */
+        loadKey(c->db, c->argv[1]);
     }
 
     /* The key exists. Return -1 if it has no expire, or the actual
@@ -728,11 +744,24 @@ void pexpiretimeCommand(client *c) {
 
 /* PERSIST key */
 void persistCommand(client *c) {
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
+    if (server.nds) {
+        /* Key needs to be in memory to manipulate TTL */
+        loadKey(c->db, c->argv[1]);
+    }
+
     if (lookupKeyWrite(c->db,c->argv[1])) {
         if (removeExpire(c->db,c->argv[1])) {
             signalModifiedKey(c,c->db,c->argv[1]);
             notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",c->argv[1],c->db->id);
             addReply(c,shared.cone);
+            if (server.nds) {
+                notifyNDS(c->db, c->argv[1]->ptr, NDS_KEY_CHANGE);
+            }
             server.dirty++;
         } else {
             addReply(c,shared.czero);

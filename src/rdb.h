@@ -176,4 +176,10 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi);
 ssize_t rdbSaveFunctions(rio *rdb);
 rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi);
 
+typedef struct {
+    redisDb *db;
+    rio *rdb;
+    long long now;
+    size_t nwritten;
+} rdbSaveIterData;
 #endif

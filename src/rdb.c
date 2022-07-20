@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "nds.h"
 #include "lzf.h"    /* LZF compression library */
 #include "zipmap.h"
 #include "endianconv.h"
@@ -1245,18 +1246,39 @@ werr:
     return -1;
 }
 
+int rdbSaveIterator(void *data, robj *key) {
+    rdbSaveIterData *idata = (rdbSaveIterData *)data;
+    long long expire = getExpire(idata->db, key);
+    robj *val = lookupKeyWrite(idata->db, key);
+    ssize_t res;
+    int rv = 0;
+
+    if ((res = rdbSaveKeyValuePair(idata->rdb, key, val, expire, idata->now)) < 0) {
+       rv = C_ERR;
+    } else {
+       idata->nwritten += res;
+       rv = C_OK;
+    }
+
+    return rv;
+}
+
 ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
-    dictIterator *di;
+    dictIterator *di = NULL;
     dictEntry *de;
     ssize_t written = 0;
     ssize_t res;
     static long long info_updated_time = 0;
     char *pname = (rdbflags & RDBFLAGS_AOF_PREAMBLE) ? "AOF rewrite" :  "RDB";
 
+    rdbSaveIterData idata;
     redisDb *db = server.db + dbid;
     dict *d = db->dict;
-    if (dictSize(d) == 0) return 0;
-    di = dictGetSafeIterator(d);
+
+    idata.db = db;
+    idata.now = info_updated_time;
+    idata.rdb = rdb;
+    idata.nwritten = 0;
 
     /* Write the SELECT DB opcode */
     if ((res = rdbSaveType(rdb,RDB_OPCODE_SELECTDB)) < 0) goto werr;
@@ -1275,37 +1297,46 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
     if ((res = rdbSaveLen(rdb,expires_size)) < 0) goto werr;
     written += res;
 
-    /* Iterate this DB writing every entry */
-    while((de = dictNext(di)) != NULL) {
-        sds keystr = dictGetKey(de);
-        robj key, *o = dictGetVal(de);
-        long long expire;
-        size_t rdb_bytes_before_key = rdb->processed_bytes;
-
-        initStaticStringObject(key,keystr);
-        expire = getExpire(db,&key);
-        if ((res = rdbSaveKeyValuePair(rdb, &key, o, expire, dbid)) < 0) goto werr;
-        written += res;
-
-        /* In fork child process, we can try to release memory back to the
-         * OS and possibly avoid or decrease COW. We give the dismiss
-         * mechanism a hint about an estimated size of the object we stored. */
-        size_t dump_size = rdb->processed_bytes - rdb_bytes_before_key;
-        if (server.in_fork_child) dismissObject(o, dump_size);
-
-        /* Update child info every 1 second (approximately).
-         * in order to avoid calling mstime() on each iteration, we will
-         * check the diff every 1024 keys */
-        if (((*key_counter)++ & 1023) == 0) {
-            long long now = mstime();
-            if (now - info_updated_time >= 1000) {
-                sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, *key_counter, pname);
-                info_updated_time = now;
+    if (server.nds) {
+        if (walkNDS(idata.db, rdbSaveIterator, &idata, -1) == C_ERR) {
+            goto werr;
+        }
+        written += idata.nwritten;
+    } else {
+        di = dictGetSafeIterator(d);
+    
+        /* Iterate this DB writing every entry */
+        while((de = dictNext(di)) != NULL) {
+            sds keystr = dictGetKey(de);
+            robj key, *o = dictGetVal(de);
+            long long expire;
+            size_t rdb_bytes_before_key = rdb->processed_bytes;
+    
+            initStaticStringObject(key,keystr);
+            expire = getExpire(db,&key);
+            if ((res = rdbSaveKeyValuePair(rdb, &key, o, expire, dbid)) < 0) goto werr;
+            written += res;
+    
+            /* In fork child process, we can try to release memory back to the
+             * OS and possibly avoid or decrease COW. We give the dismiss
+             * mechanism a hint about an estimated size of the object we stored. */
+            size_t dump_size = rdb->processed_bytes - rdb_bytes_before_key;
+            if (server.in_fork_child) dismissObject(o, dump_size);
+    
+            /* Update child info every 1 second (approximately).
+             * in order to avoid calling mstime() on each iteration, we will
+             * check the diff every 1024 keys */
+            if (((*key_counter)++ & 1023) == 0) {
+                long long now = mstime();
+                if (now - info_updated_time >= 1000) {
+                    sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, *key_counter, pname);
+                    info_updated_time = now;
+                }
             }
         }
+    
+        dictReleaseIterator(di);
     }
-
-    dictReleaseIterator(di);
     return written;
 
 werr:
@@ -1470,6 +1501,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi) {
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
+    preforkNDS();
     if ((childpid = redisFork(CHILD_TYPE_RDB)) == 0) {
         int retval;
 
@@ -2690,6 +2722,9 @@ void startLoading(size_t size, int rdbflags, int async) {
     server.loading_rdb_used_mem = 0;
     server.rdb_last_load_keys_expired = 0;
     server.rdb_last_load_keys_loaded = 0;
+    if (server.nds) {
+        nukeNDSFromOrbit();
+    }
     blockingOperationStarts();
 
     /* Fire the loading modules start event. */
@@ -2782,6 +2817,36 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
         processEventsWhileBlocked();
         processModuleLoadingProgressEvent(0);
     }
+            if (server.nds) {
+                /* Flush as often as we can */
+                checkNDSChildComplete();
+
+                if (server.child_pid == -1) {
+                    backgroundDirtyKeysFlush();
+                }
+            }
+
+            /* It's important to avoid going over memory limits if possible.
+             * When using NDS, we will wait until we're under our memory
+             * limit again (that means that the background flush has
+             * finished) before we try to load any more data into memory.
+             * On the other hand, for non-NDS situations, we'll probably be
+             * throwing out data, but at least we're not exceeding
+             * maxmemory...  */
+            while (performEvictions() == C_ERR && server.nds) {
+                if (server.child_pid == -1) {
+                    /* Well, this is a problem.  We're not running a flush,
+                     * so we shouldn't have any (or many) dirty keys that we
+                     * can't drop, and yet performEvictions() wasn't able
+                     * to get us back underneath maxmemory.  We're going to
+                     * have to bomb out with an error, we can't continue. */
+                    serverLog(LL_WARNING, "Memory limit fatally exceeded during RDB load.  Check maxmemory-policy is set to something evictable, and consider increasing maxmemory.  Aborting now.");
+                    exit(1);
+                }
+                usleep(100);
+                checkNDSChildComplete();
+                processEventsWhileBlocked();
+            }
 }
 
 /* Save the given functions_ctx to the rdb.

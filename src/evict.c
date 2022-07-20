@@ -31,6 +31,7 @@
  */
 
 #include "server.h"
+#include "nds.h"
 #include "bio.h"
 #include "atomicvar.h"
 #include "script.h"
@@ -396,6 +397,8 @@ size_t freeMemoryGetNotCountedMemory(void) {
  */
 int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *level) {
     size_t mem_reported, mem_used, mem_tofree;
+    size_t mem_limit = (server.nds && server.nds_watermark > 0)
+                         ? server.nds_watermark : server.maxmemory;
 
     /* Check if we are over the memory usage limit. If we are not, no need
      * to subtract the slaves output buffers. We can just return ASAP. */
@@ -403,11 +406,11 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
     if (total) *total = mem_reported;
 
     /* We may return ASAP if there is no need to compute the level. */
-    if (!server.maxmemory) {
+    if (!mem_limit) {
         if (level) *level = 0;
         return C_OK;
     }
-    if (mem_reported <= server.maxmemory && !level) return C_OK;
+    if (mem_reported <= mem_limit && !level) return C_OK;
 
     /* Remove the size of slaves output buffers and AOF buffer from the
      * count of used memory. */
@@ -418,10 +421,10 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
     /* Compute the ratio of memory usage. */
     if (level) *level = (float)mem_used / (float)server.maxmemory;
 
-    if (mem_reported <= server.maxmemory) return C_OK;
+    if (mem_reported <= mem_limit) return C_OK;
 
     /* Check if we are still over the memory limit. */
-    if (mem_used <= server.maxmemory) return C_OK;
+    if (mem_used <= mem_limit) return C_OK;
 
     /* Compute how much memory we need to free. */
     mem_tofree = mem_used - server.maxmemory;
@@ -513,6 +516,314 @@ static unsigned long evictionTimeLimitUs() {
     return ULONG_MAX;   /* No limit to eviction time */
 }
 
+/* This is an NDS-specific version of performEvictions(), called *instead*
+ * of that function when NDS has been enabled in the config file.  It does
+ * things...  a little differently.
+ *
+ * I've pulled this out into a completely separate function because it does
+ * a lot of things rather differently, and I'd prefer it that the differing
+ * logic didn't make a mess of the original implementation and introduce
+ * hideous and unpleasant bugs.
+ */
+
+int performEvictionsNDS(void) {
+    size_t mem_used;
+    size_t mem_limit = server.nds_watermark > 0
+                         ? server.nds_watermark : server.maxmemory;
+
+    /* 0 == "no limit", so that's easy */
+    if (server.maxmemory == 0 && server.nds_watermark == 0) return C_OK;
+
+    int keys_freed = 0;
+    size_t mem_reported, mem_tofree;
+    long long mem_freed; /* May be negative */
+    mstime_t latency, eviction_latency;
+    long long delta;
+    int slaves = listLength(server.slaves);
+    int result = EVICT_FAIL;
+
+    if (getMaxmemoryState(&mem_reported,&mem_used,&mem_tofree,NULL) == C_OK) {
+        result = EVICT_OK;
+        //goto update_metrics;
+        return result;
+    }
+
+    if (server.maxmemory_policy == MAXMEMORY_NO_EVICTION) {
+        result = EVICT_FAIL;  /* We need to free memory, but policy forbids. */
+        //goto update_metrics;
+        return result;
+    }
+
+    unsigned long eviction_time_limit_us = evictionTimeLimitUs();
+
+    mem_freed = 0;
+
+    latencyStartMonitor(latency);
+
+    monotime evictionTimer;
+    elapsedStart(&evictionTimer);
+
+    /* Unlike active-expire and blocked client, we can reach here from 'CONFIG SET maxmemory'
+     * so we have to back-up and restore server.core_propagates. */
+    int prev_core_propagates = server.core_propagates;
+    serverAssert(server.also_propagate.numops == 0);
+    server.core_propagates = 1;
+    server.propagate_no_multi = 1;
+
+    while (mem_used > mem_limit) {
+        int j, k, i;
+        static unsigned int next_db = 0;
+        sds bestkey = NULL;
+        int bestdbid = 0;
+        redisDb *db;
+        dict *dict;
+        dictEntry *de;
+
+        /* We need to clear some memory... if we're not already flushing
+         * keys, now would be a very, very good time to do it.  */
+        if (server.child_pid == -1) {
+            serverLog(LL_DEBUG, "Starting an NDS flush in freeMemoryIfNeeded");
+            if (backgroundDirtyKeysFlush() == C_ERR) {
+                serverLog(LL_WARNING, "Failed to trigger background key flush in freeMemoryIfNeeded.  Urgh.");
+                return C_ERR;
+            }
+        } else {
+            /* We need to do this frequently otherwise the list of
+             * dirty/flushing keys will never be cleared, even when
+             * they're actually flushed to disk */
+            checkNDSChildComplete();
+        }
+
+        if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU|MAXMEMORY_FLAG_LFU) ||
+            server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL)
+        {
+            struct evictionPoolEntry *pool = EvictionPoolLRU;
+
+            while(bestkey == NULL) {
+                unsigned long total_keys = 0, keys;
+
+                /* We don't want to make local-db choices when expiring keys,
+                 * so to start populate the eviction pool sampling keys from
+                 * every DB. */
+                for (i = 0; i < server.dbnum; i++) {
+                    db = server.db+i;
+                    dict = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ?
+                            db->dict : db->expires;
+                    if ((keys = dictSize(dict)) != 0) {
+                        evictionPoolPopulate(i, dict, db->dict, pool);
+                        total_keys += keys;
+                    }
+                }
+                if (!total_keys) break; /* No keys to evict. */
+
+                /* Go backward from best to worst element to evict. */
+                for (k = EVPOOL_SIZE-1; k >= 0; k--) {
+                    if (pool[k].key == NULL) continue;
+                    bestdbid = pool[k].dbid;
+
+                    if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
+                        de = dictFind(server.db[bestdbid].dict,
+                            pool[k].key);
+                    } else {
+                        de = dictFind(server.db[bestdbid].expires,
+                            pool[k].key);
+                    }
+
+                    /* Remove the entry from the pool. */
+                    if (pool[k].key != pool[k].cached)
+                        sdsfree(pool[k].key);
+                    pool[k].key = NULL;
+                    pool[k].idle = 0;
+
+                    /* If the key exists, is our pick. Otherwise it is
+                     * a ghost and we need to try the next element. */
+                    if (de) {
+                        bestkey = dictGetKey(de);
+                        break;
+                    } else {
+                        /* Ghost... Iterate again. */
+                    }
+                }
+            }
+        }
+
+        /* volatile-random and allkeys-random policy */
+        else if (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM ||
+                 server.maxmemory_policy == MAXMEMORY_VOLATILE_RANDOM)
+        {
+            /* When evicting a random key, we try to evict a key for
+             * each DB, so we use the static 'next_db' variable to
+             * incrementally visit all DBs. */
+            for (i = 0; i < server.dbnum; i++) {
+                j = (++next_db) % server.dbnum;
+                db = server.db+j;
+                dict = (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM) ?
+                        db->dict : db->expires;
+                if (dictSize(dict) != 0) {
+                    de = dictGetRandomKey(dict);
+                    bestkey = dictGetKey(de);
+                    bestdbid = j;
+                    break;
+                }
+            }
+        }
+
+        if (!bestkey || isDirtyKey(server.db+bestdbid, bestkey)) {
+            serverLog(LL_DEBUG, "Didn't find a clean key to nuke; finding first available key");
+            /* Our plan to quickly find a key to discard has failed; now we're getting
+             * desperate.  Let's just find the first key that isn't dirty, throw that
+             * out, and get on with our day. */
+            for (j = 0; j < server.dbnum; j++) {
+                db = server.db+j;
+
+                dictEntry *de;
+                dictIterator *di;
+
+                if (server.maxmemory_policy == MAXMEMORY_ALLKEYS_LRU ||
+                    server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM)
+                {
+                    dict = db->dict;
+                } else {
+                    dict = db->expires;
+                }
+
+                serverLog(LL_DEBUG, "DB %i has %lu keys", j, dictSize(dict));
+                if (dictSize(dict) == 0) continue;
+
+                di = dictGetSafeIterator(dict);
+                while ((!bestkey || isDirtyKey(db, bestkey)) && (de = dictNext(di)) != NULL) {
+                    bestkey = dictGetKey(de);
+                }
+                dictReleaseIterator(di);
+
+                /* After all that, do we have a clean key to discard? */
+                db = server.db+bestdbid;
+                if (bestkey && !isDirtyKey(db, bestkey)) {
+                    /* Well, that's a relief */
+                    serverLog(LL_DEBUG, "Phew, found clean key %s in DB %i to nuke", bestkey, j);
+                    bestdbid = j;
+                    break;
+                }
+            }
+
+            db = server.db+bestdbid;
+            if (bestkey && isDirtyKey(db, bestkey)) {
+                /* WTF?  *Everything's* dirty?  Well, I guess we're screwed. */
+                serverLog(LL_DEBUG, "No clean keys to nuke");
+                bestkey = NULL;
+            }
+        }
+
+        /* Finally remove the selected key, if we have one. */
+        if (bestkey) {
+            db = server.db+bestdbid;
+            robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
+            /* We compute the amount of memory freed by db*Delete() alone.
+             * It is possible that actually the memory needed to propagate
+             * the DEL in AOF and replication link is greater than the one
+             * we are freeing removing the key, but we can't account for
+             * that otherwise we would never exit the loop.
+             *
+             * Same for CSC invalidation messages generated by signalModifiedKey.
+             *
+             * AOF and Output buffer memory will be freed eventually so
+             * we only care about memory used by the key space. */
+            delta = (long long) zmalloc_used_memory();
+            latencyStartMonitor(eviction_latency);
+            /* dbDelete nukes the key from NDS, which is quite particularly
+             * not what we want.  So we do it by hand. */
+            //if (server.lazyfree_lazy_eviction)
+            //    dbAsyncDelete(db,keyobj);
+            //else
+             //   dbSyncDelete(db,keyobj);
+            if (dictSize(db->expires) > 0)
+                dictDelete(db->expires,bestkey);
+            dictDelete(db->dict,bestkey);
+            latencyEndMonitor(eviction_latency);
+            latencyAddSampleIfNeeded("eviction-del",eviction_latency);
+            delta -= (long long) zmalloc_used_memory();
+            mem_freed += delta;
+            mem_used -= delta;
+            server.stat_evictedkeys++;
+            signalModifiedKey(NULL,db,keyobj);
+            notifyKeyspaceEvent(NOTIFY_EVICTED, "evicted",
+                keyobj, db->id);
+            propagateDeletion(db,keyobj,server.lazyfree_lazy_eviction);
+            decrRefCount(keyobj);
+            keys_freed++;
+
+            if (keys_freed % 16 == 0) {
+                /* When the memory to free starts to be big enough, we may
+                 * start spending so much time here that is impossible to
+                 * deliver data to the replicas fast enough, so we force the
+                 * transmission here inside the loop. */
+                if (slaves) flushSlavesOutputBuffers();
+
+                /* Normally our stop condition is the ability to release
+                 * a fixed, pre-computed amount of memory. However when we
+                 * are deleting objects in another thread, it's better to
+                 * check, from time to time, if we already reached our target
+                 * memory, since the "mem_freed" amount is computed only
+                 * across the dbAsyncDelete() call, while the thread can
+                 * release the memory all the time. */
+                if (server.lazyfree_lazy_eviction) {
+                    if (getMaxmemoryState(NULL,NULL,NULL,NULL) == C_OK) {
+                        break;
+                    }
+                }
+
+                /* After some time, exit the loop early - even if memory limit
+                 * hasn't been reached.  If we suddenly need to free a lot of
+                 * memory, don't want to spend too much time here.  */
+                if (elapsedUs(evictionTimer) > eviction_time_limit_us) {
+                    // We still need to free memory - start eviction timer proc
+                    startEvictionTimeProc();
+                    break;
+                }
+            }
+        } else {
+            if (mem_used > server.maxmemory) {
+                serverLog(LL_WARNING, "No keys suitable for eviction");
+                goto cant_free; /* nothing to free... */
+            } else {
+                /* We ran out of keys to free, but we're not over maxmemory,
+                 * so we'll just return OK, and hope a flush completes so we
+                 * can free more memory later.  */
+                serverLog(LL_NOTICE, "Didn't get down to NDS watermark; hope that's OK");
+                return C_OK;
+            }
+        }
+    }
+    /* at this point, the memory is OK, or we have reached the time limit */
+    result = (isEvictionProcRunning) ? EVICT_RUNNING : EVICT_OK;
+
+cant_free:
+    if (result == EVICT_FAIL) {
+        /* At this point, we have run out of evictable items.  It's possible
+         * that some items are being freed in the lazyfree thread.  Perform a
+         * short wait here if such jobs exist, but don't wait long.  */
+        if (bioPendingJobsOfType(BIO_LAZY_FREE)) {
+            usleep(eviction_time_limit_us);
+            if (getMaxmemoryState(NULL,NULL,NULL,NULL) == C_OK) {
+                result = EVICT_OK;
+            }
+        }
+    }
+
+    serverAssert(server.core_propagates); /* This function should not be re-entrant */
+
+    /* Propagate all DELs */
+    propagatePendingCommands();
+
+    server.core_propagates = prev_core_propagates;
+    server.propagate_no_multi = 0;
+
+    latencyEndMonitor(latency);
+    latencyAddSampleIfNeeded("eviction-cycle",latency);
+
+    return result;
+}
+
 /* Check that memory usage is within the current "maxmemory" limit.  If over
  * "maxmemory", attempt to free memory by evicting data (if it's safe to do so).
  *
@@ -549,6 +860,11 @@ int performEvictions(void) {
     long long delta;
     int slaves = listLength(server.slaves);
     int result = EVICT_FAIL;
+
+    if (server.nds) {
+        result = performEvictionsNDS();
+        goto update_metrics;
+    }
 
     if (getMaxmemoryState(&mem_reported,NULL,&mem_tofree,NULL) == C_OK) {
         result = EVICT_OK;

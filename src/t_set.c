@@ -304,6 +304,11 @@ void saddCommand(client *c) {
     robj *set;
     int j, added = 0;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     set = lookupKeyWrite(c->db,c->argv[1]);
     if (checkType(c,set,OBJ_SET)) return;
     
@@ -326,6 +331,11 @@ void saddCommand(client *c) {
 void sremCommand(client *c) {
     robj *set;
     int j, deleted = 0, keyremoved = 0;
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
 
     if ((set = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL ||
         checkType(c,set,OBJ_SET)) return;
@@ -356,6 +366,11 @@ void smoveCommand(client *c) {
     srcset = lookupKeyWrite(c->db,c->argv[1]);
     dstset = lookupKeyWrite(c->db,c->argv[2]);
     ele = c->argv[3];
+
+    if (validKey(c->argv[1]) == C_ERR || validKey(c->argv[2]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
 
     /* If the source key does not exist return 0 */
     if (srcset == NULL) {
@@ -409,6 +424,11 @@ void smoveCommand(client *c) {
 void sismemberCommand(client *c) {
     robj *set;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
         checkType(c,set,OBJ_SET)) return;
 
@@ -440,6 +460,11 @@ void smismemberCommand(client *c) {
 void scardCommand(client *c) {
     robj *o;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
         checkType(c,o,OBJ_SET)) return;
 
@@ -462,6 +487,11 @@ void spopWithCountCommand(client *c) {
     /* Get the count argument */
     if (getPositiveLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK) return;
     count = (unsigned long) l;
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
 
     /* Make sure a key with the name inputted exists, and that it's type is
      * indeed a set. Otherwise, return nil */
@@ -609,6 +639,11 @@ void spopCommand(client *c) {
         return;
     }
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     /* Make sure a key with the name inputted exists, and that it's type is
      * indeed a set */
     if ((set = lookupKeyWriteOrReply(c,c->argv[1],shared.null[c->resp]))
@@ -673,6 +708,11 @@ void srandmemberWithCountCommand(client *c) {
          * (i.e. don't remove the extracted element after every extraction). */
         count = -l;
         uniq = 0;
+    }
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
     }
 
     if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.emptyarray))
@@ -812,6 +852,11 @@ void srandmemberCommand(client *c) {
     int64_t llele;
     int encoding;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if (c->argc == 3) {
         srandmemberWithCountCommand(c);
         return;
@@ -869,6 +914,13 @@ void sinterGenericCommand(client *c, robj **setkeys,
     void *replylen = NULL;
     unsigned long j, cardinality = 0;
     int encoding, empty = 0;
+
+    for (int j = 1; j < c->argc; j++) {
+        if (validKey(c->argv[j]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
+    }
 
     for (j = 0; j < setnum; j++) {
         robj *setobj = lookupKeyRead(c->db, setkeys[j]);
@@ -1055,6 +1107,13 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
     sds ele;
     int j, cardinality = 0;
     int diff_algo = 1;
+
+    for (j = 1; j < c->argc; j++) {
+        if (validKey(c->argv[j]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
+    }
 
     for (j = 0; j < setnum; j++) {
         robj *setobj = lookupKeyRead(c->db, setkeys[j]);

@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "nds.h"
 #include "cluster.h"
 #include "atomicvar.h"
 #include "latency.h"
@@ -51,6 +52,41 @@ void updateLFU(robj *val) {
     unsigned long counter = LFUDecrAndReturn(val);
     counter = LFULogIncr(counter);
     val->lru = (LFUGetTimeInMinutes()<<8) | counter;
+}
+
+/* Ensure that the specified key is in memory, if it exists.  Returns
+ * C_OK if NDS is off, or if the key was loaded, and C_ERR if the
+ * key wasn't found in NDS.  */
+int loadKey(redisDb *db, robj *key) {
+    if (!server.nds) {
+        return C_OK;
+    }
+
+    /* Don't want to go to disk if the data is in-memory -- that'll
+     * overwrite possibly-newer in memory data with stale data from disk */
+    if (dictFind(db->dict, key->ptr)) {
+        return C_OK;
+    } else {
+        return getNDS(db, key) ? C_OK : C_ERR;
+    }
+}
+
+/* Determine whether or not a key name is valid or not, given the current
+ * database storage in use.
+ * Returns C_OK if the key is valid, or C_ERR otherwise.  */
+int validKey(robj *key) {
+    if (!server.nds) {
+        /* I believe that, in theory, Redis only supports keys up to
+         * 2^31 bytes in length.  I'm happy to consider that a "will
+         * never happen" event. */
+        return C_OK;
+    }
+
+    if (sdslen(key->ptr) == 0 || sdslen(key->ptr) > 511) {
+        return C_ERR;
+    }
+
+    return C_OK;
 }
 
 /* Lookup a key for read or write operations, or return NULL if the key is not
@@ -79,8 +115,11 @@ void updateLFU(robj *val) {
  * expired on replicas even if the master is lagging expiring our key via DELs
  * in the replication link. */
 robj *lookupKey(redisDb *db, robj *key, int flags) {
-    dictEntry *de = dictFind(db->dict,key->ptr);
     robj *val = NULL;
+    dictEntry *de = dictFind(db->dict,key->ptr);
+    if (validKey(key) == C_ERR) {
+        return NULL;
+    }
     if (de) {
         val = dictGetVal(de);
         /* Forcing deletion of expired keys on a replica makes the replica
@@ -96,6 +135,18 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
         if (expireIfNeeded(db, key, force_delete_expired)) {
             /* The key is no longer valid. */
             val = NULL;
+        }
+    }
+
+    if (server.nds) {
+        if (de) {
+            server.stat_nds_cache_hits++;
+        } else {
+            robj *obj = getNDS(db, key);
+
+            server.stat_nds_cache_misses++;
+
+            val = obj;
         }
     }
 
@@ -176,13 +227,20 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
  *
  * The program is aborted if the key already exists. */
 void dbAdd(redisDb *db, robj *key, robj *val) {
-    sds copy = sdsdup(key->ptr);
+    sds copy;
+    if (validKey(key) == C_ERR) {
+        return;
+    }
+    copy = sdsdup(key->ptr);
     dictEntry *de = dictAddRaw(db->dict, copy, NULL);
     serverAssertWithInfo(NULL, key, de != NULL);
     dictSetVal(db->dict, de, val);
     signalKeyAsReady(db, key, val->type);
     if (server.cluster_enabled) slotToKeyAddEntry(de, db);
     notifyKeyspaceEvent(NOTIFY_NEW,"new",key,db->id);
+    if (server.nds) {
+        notifyNDS(db, key->ptr, NDS_KEY_ADD);
+    }
 }
 
 /* This is a special version of dbAdd() that is used only when loading
@@ -212,7 +270,14 @@ int dbAddRDBLoad(redisDb *db, sds key, robj *val) {
 void dbOverwrite(redisDb *db, robj *key, robj *val) {
     dictEntry *de = dictFind(db->dict,key->ptr);
 
+    if (validKey(key) == C_ERR) {
+        return;
+    }
+
     serverAssertWithInfo(NULL,key,de != NULL);
+    if (server.nds) {
+        notifyNDS(db, key->ptr, NDS_KEY_CHANGE);
+    }
     dictEntry auxentry = *de;
     robj *old = dictGetVal(de);
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
@@ -250,6 +315,10 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
  * in a context where there is no clear client performing the operation. */
 void setKey(client *c, redisDb *db, robj *key, robj *val, int flags) {
     int keyfound = 0;
+
+    if (validKey(key) == C_ERR) {
+        return;
+    }
 
     if (flags & SETKEY_ALREADY_EXIST)
         keyfound = 1;
@@ -307,9 +376,24 @@ robj *dbRandomKey(redisDb *db) {
 
 /* Helper for sync and async delete. */
 static int dbGenericDelete(redisDb *db, robj *key, int async) {
+    int delcount = 0;
+
+    if (validKey(key) == C_ERR) {
+        return -1;
+    }
+
     /* Deleting an entry from the expires dict will not free the sds of
      * the key, because it is shared with the main dictionary. */
     if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
+
+    if (server.nds && existsNDS(db, key)) {
+        /* The key may not be in memory, just in NDS, so we need to check
+         * there too in order to give the client the right answer to the
+         * DEL command.
+         */
+        delcount++;
+    }
+
     dictEntry *de = dictUnlink(db->dict,key->ptr);
     if (de) {
         robj *val = dictGetVal(de);
@@ -324,6 +408,10 @@ static int dbGenericDelete(redisDb *db, robj *key, int async) {
         }
         if (server.cluster_enabled) slotToKeyDelEntry(de, db);
         dictFreeUnlinkedEntry(db->dict,de);
+        delcount++;
+    }
+
+    if (delcount > 0) {
         return 1;
     } else {
         return 0;
@@ -412,6 +500,9 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
             dictEmpty(dbarray[j].dict,callback);
             dictEmpty(dbarray[j].expires,callback);
         }
+        if (server.nds) {
+            emptyNDS(&dbarray[j]);
+        }
         /* Because all keys of database are removed, reset average ttl. */
         dbarray[j].avg_ttl = 0;
         dbarray[j].expires_cursor = 0;
@@ -458,6 +549,9 @@ long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
 
     /* Empty redis database structure. */
     removed = emptyDbStructure(server.db, dbnum, async, callback);
+    if (server.nds) {
+        emptyNDS(server.db);
+    }
 
     /* Flush slots to keys map if enable cluster, we can flush entire
      * slots to keys map whatever dbnum because only support one DB
@@ -544,6 +638,9 @@ long long dbTotalServerKeyCount() {
 /* Note that the 'c' argument may be NULL if the key was modified out of
  * a context of a client. */
 void signalModifiedKey(client *c, redisDb *db, robj *key) {
+    if (server.nds) {
+        notifyNDS(db, key->ptr, NDS_KEY_CHANGE);
+    }
     touchWatchedKey(db,key);
     trackingInvalidateKey(c,key,1);
 }
@@ -658,6 +755,13 @@ void delGenericCommand(client *c, int lazy) {
     int numdel = 0, j;
 
     for (j = 1; j < c->argc; j++) {
+        if (validKey(c->argv[j]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
+    }
+
+    for (j = 1; j < c->argc; j++) {
         expireIfNeeded(c->db,c->argv[j],0);
         int deleted  = lazy ? dbAsyncDelete(c->db,c->argv[j]) :
                               dbSyncDelete(c->db,c->argv[j]);
@@ -685,6 +789,13 @@ void unlinkCommand(client *c) {
 void existsCommand(client *c) {
     long long count = 0;
     int j;
+
+    for (j = 1; j < c->argc; j++) {
+        if (validKey(c->argv[j]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
+    }
 
     for (j = 1; j < c->argc; j++) {
         if (lookupKeyReadWithFlags(c->db,c->argv[j],LOOKUP_NOTOUCH)) count++;
@@ -721,31 +832,62 @@ void randomkeyCommand(client *c) {
     decrRefCount(key);
 }
 
-void keysCommand(client *c) {
-    dictIterator *di;
-    dictEntry *de;
-    sds pattern = c->argv[1]->ptr;
-    int plen = sdslen(pattern), allkeys;
-    unsigned long numkeys = 0;
-    void *replylen = addReplyDeferredLen(c);
+int keysCommandWalkerCallback(void *data, robj *key) {
+    keysCommandWalkerData *w = (keysCommandWalkerData *)data;
 
-    di = dictGetSafeIterator(c->db->dict);
-    allkeys = (pattern[0] == '*' && plen == 1);
-    while((de = dictNext(di)) != NULL) {
-        sds key = dictGetKey(de);
-        robj *keyobj;
-
-        if (allkeys || stringmatchlen(pattern,plen,key,sdslen(key),0)) {
-            keyobj = createStringObject(key,sdslen(key));
-            if (!keyIsExpired(c->db,keyobj)) {
-                addReplyBulk(c,keyobj);
-                numkeys++;
-            }
-            decrRefCount(keyobj);
+    if (w->allkeys || stringmatchlen(w->pattern,w->plen,key->ptr,sdslen(key->ptr),0)) {
+        if (!keyIsExpired(w->c->db,key)) {
+            addReplyBulk(w->c,key);
+            w->numkeys++;
         }
     }
-    dictReleaseIterator(di);
-    setDeferredArrayLen(c,replylen,numkeys);
+
+    return C_OK;
+}
+
+void keysCommand(client *c) {
+    keysCommandWalkerData w;
+
+    w.pattern = c->argv[1]->ptr;
+    w.plen = sdslen(w.pattern);
+    w.allkeys = (w.pattern[0] == '*' && w.plen == 1);
+    w.c = c;
+    w.numkeys = 0;
+
+    void *replylen = addReplyDeferredLen(c);
+
+    if (server.nds) {
+        /* Oh my... this could take a while... */
+
+        /* First we need to flush all dirty keys to disk, because we only
+         * want to have to walk one database */
+        while (server.child_pid != -1) {
+            usleep(100);
+            checkNDSChildComplete();
+        }
+        if (flushDirtyKeys() == C_ERR) {
+            serverLog(LL_WARNING, "flushDirtyKeys() failed in KEYS command -- oh my!");
+            addReplyError(c, "NDS flush failed");
+            return;
+        }
+        postNDSFlushCleanup();
+
+        /* Now we can walk the NDS database, safe in the knowledge that all
+         * possible keys exist there for our inspection. */
+        walkNDS(c->db, keysCommandWalkerCallback, &w, -1);
+    } else {
+        dictIterator *di;
+        dictEntry *de;
+        di = dictGetSafeIterator(c->db->dict);
+        while((de = dictNext(di)) != NULL) {
+            sds key = dictGetKey(de);
+            robj *keyobj = createStringObject(key,sdslen(key));
+            keysCommandWalkerCallback(&w, keyobj);
+            decrRefCount(keyobj);
+        }
+        dictReleaseIterator(di);
+    }
+    setDeferredArrayLen(c,replylen,w.numkeys);
 }
 
 /* This callback is used by scanGenericCommand in order to collect elements
@@ -1533,6 +1675,12 @@ void setExpire(client *c, redisDb *db, robj *key, long long when) {
 long long getExpire(redisDb *db, robj *key) {
     dictEntry *de;
 
+    if (server.nds) {
+        /* Need to ensure the key's loaded before we can check whether its
+         * expired */
+        loadKey(db, key);
+    }
+
     /* No expire? return ASAP */
     if (dictSize(db->expires) == 0 ||
        (de = dictFind(db->expires,key->ptr)) == NULL) return -1;
@@ -1687,6 +1835,10 @@ int expireIfNeeded(redisDb *db, robj *key, int force_delete_expired) {
     if (checkClientPauseTimeoutAndReturnIfPaused()) return 1;
 
     /* Delete the key */
+    if (server.nds) {
+        notifyNDS(db, key->ptr, NDS_KEY_EXPIRED);
+    }
+
     deleteExpiredKeyAndPropagate(db,key);
     return 1;
 }

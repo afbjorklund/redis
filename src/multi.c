@@ -450,8 +450,13 @@ void watchCommand(client *c) {
         addReply(c,shared.ok);
         return;
     }
-    for (j = 1; j < c->argc; j++)
+    for (j = 1; j < c->argc; j++) {
+        if (validKey(c->argv[j]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
         watchForKey(c,c->argv[j]);
+    }
     addReply(c,shared.ok);
 }
 

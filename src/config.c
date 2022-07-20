@@ -2413,8 +2413,12 @@ static int updateReplBacklogSize(const char **err) {
 }
 
 static int updateMaxmemory(const char **err) {
-    UNUSED(err);
     if (server.maxmemory) {
+        if (server.nds_watermark > 0
+          && server.maxmemory <= server.nds_watermark) {
+            *err = "nds-watermark must be less than maxmemory";
+            return 0;
+        }
         size_t used = zmalloc_used_memory()-freeMemoryGetNotCountedMemory();
         if (server.maxmemory < used) {
             serverLog(LL_WARNING,"WARNING: the new maxmemory value set via CONFIG SET (%llu) is smaller than the current memory usage (%zu). This will result in key eviction and/or the inability to accept new write commands depending on the maxmemory-policy.", server.maxmemory, used);
@@ -3068,6 +3072,12 @@ standardConfig static_configs[] = {
     createTimeTConfig("repl-backlog-ttl", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.repl_backlog_time_limit, 60*60, INTEGER_CONFIG, NULL, NULL), /* Default: 1 hour */
     createOffTConfig("auto-aof-rewrite-min-size", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.aof_rewrite_min_size, 64*1024*1024, MEMORY_CONFIG, NULL, NULL),
     createOffTConfig("loading-process-events-interval-bytes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1024, INT_MAX, server.loading_process_events_interval_bytes, 1024*1024*2, INTEGER_CONFIG, NULL, NULL),
+
+    /* NDS */
+    createBoolConfig("nds", NULL, MODIFIABLE_CONFIG, server.nds, 0, NULL, NULL),
+    createULongLongConfig("nds-watermark", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.nds_watermark, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
+    createBoolConfig("nds-preload", NULL, MODIFIABLE_CONFIG, server.nds_preload, 0, NULL, NULL),
+    createBoolConfig("nds-keycache", NULL, MODIFIABLE_CONFIG, server.nds_keycache, 0, NULL, NULL),
 
 #ifdef USE_OPENSSL
     createIntConfig("tls-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.tls_port, 0, INTEGER_CONFIG, NULL, applyTLSPort), /* TCP port. */
