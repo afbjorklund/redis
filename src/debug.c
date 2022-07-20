@@ -605,6 +605,14 @@ NULL
         robj *val;
         char *strenc;
 
+        if (validKey(c->argv[2]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
+
+        /* Perhaps we need to go to disk? */
+        loadKey(c->db, c->argv[2]);
+
         if ((de = dictFind(c->db->dict,c->argv[2]->ptr)) == NULL) {
             addReplyErrorObject(c,shared.nokeyerr);
             return;
@@ -656,6 +664,11 @@ NULL
         dictEntry *de;
         robj *val;
         sds key;
+
+        if (validKey(c->argv[2]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
 
         if ((de = dictFind(c->db->dict,c->argv[2]->ptr)) == NULL) {
             addReplyErrorObject(c,shared.nokeyerr);
@@ -891,6 +904,11 @@ NULL
         sds stats = sdsempty();
         char buf[4096];
         int full = 0;
+
+        if (validKey(c->argv[2]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
 
         if (getLongFromObjectOrReply(c, c->argv[2], &dbid, NULL) != C_OK) {
             sdsfree(stats);

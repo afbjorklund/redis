@@ -53,6 +53,8 @@
 #include <sys/socket.h>
 #include <lua.h>
 #include <signal.h>
+#include <lmdb.h>
+#include "hdr_histogram.h"
 
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
@@ -684,6 +686,8 @@ typedef enum {
 #define BUSY_MODULE_YIELD_EVENTS (1<<0)
 #define BUSY_MODULE_YIELD_CLIENTS (1<<1)
 
+#define REDIS_FREEZER_FILENAME_LEN 255
+
 /*-----------------------------------------------------------------------------
  * Data types
  *----------------------------------------------------------------------------*/
@@ -973,6 +977,9 @@ typedef struct redisDb {
                                              * This is a subset of blocking_keys*/
     dict *ready_keys;           /* Blocked keys that received a PUSH */
     dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+    dict *dirty_keys;           /* Keys that have been changed but not yet flushed */
+    dict *flushing_keys;        /* Keys being flushed by a child at the moment */
+    dict *nds_keys;             /* All the keys stored in NDS */
     int id;                     /* Database ID */
     long long avg_ttl;          /* Average TTL, just for stats */
     unsigned long expires_cursor; /* Cursor of the active expire cycle. */
@@ -1311,7 +1318,7 @@ struct sharedObjectsStruct {
     robj *ok, *err, *emptybulk, *czero, *cone, *pong, *space,
     *queued, *null[4], *nullarray[4], *emptymap[4], *emptyset[4],
     *emptyarray, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
-    *outofrangeerr, *noscripterr, *loadingerr,
+    *outofrangeerr, *noscripterr, *loadingerr, *invalidkeyerr,
     *slowevalerr, *slowscripterr, *slowmoduleerr, *bgsaveerr,
     *masterdownerr, *roslaveerr, *execaborterr, *noautherr, *noreplicaserr,
     *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk, *subscribebulk,
@@ -1384,6 +1391,19 @@ typedef struct redisOpArray {
     int numops;
     int capacity;
 } redisOpArray;
+
+/* NDS DB
+ */
+typedef struct NDSDB {
+    MDB_env *env;
+    MDB_txn *txn;
+    MDB_dbi dbi;
+    redisDb *rdb;
+    unsigned int refs;
+    char db_name[REDIS_FREEZER_FILENAME_LEN];
+    unsigned int txn_count;
+    int writer;
+} NDSDB;
 
 /* This structure is returned by the getMemoryOverheadData() function in
  * order to return memory overhead information. */
@@ -1523,12 +1543,14 @@ typedef struct {
 #define CHILD_TYPE_AOF 2
 #define CHILD_TYPE_LDB 3
 #define CHILD_TYPE_MODULE 4
+#define CHILD_TYPE_NDS 5
 
 typedef enum childInfoType {
     CHILD_INFO_TYPE_CURRENT_INFO,
     CHILD_INFO_TYPE_AOF_COW_SIZE,
     CHILD_INFO_TYPE_RDB_COW_SIZE,
-    CHILD_INFO_TYPE_MODULE_COW_SIZE
+    CHILD_INFO_TYPE_MODULE_COW_SIZE,
+    CHILD_INFO_TYPE_NDS_COW_SIZE,
 } childInfoType;
 
 struct redisServer {
@@ -1817,6 +1839,27 @@ struct redisServer {
     int key_load_delay;             /* Delay in microseconds between keys while
                                      * loading aof or rdb. (for testings). negative
                                      * value means fractions of microseconds (on average). */
+    /* NDS persistence */
+    int nds;                        /* Enable/disable NDS */
+    unsigned long long nds_watermark; /* How much memory we should try to restrict
+                                       * ourselves to */
+    int nds_preload;                /* Should we load all keys out of NDS on startup? */
+    int nds_preload_in_progress;    /* Are we currently preloading? */
+    int nds_preload_complete;       /* Have we already preloaded? */
+    int nds_keycache;               /* Are we using the keycache optimisation? */
+    int nds_snapshot_in_progress;   /* Whether we are currently doing a snapshot dump */
+    int nds_snapshot_pending;       /* Whether we're waiting on another NDS dump to
+                                     * complete before starting an NDS snapshot */
+    client *nds_bg_requestor;       /* The redis client which requested we perform
+                                     * a background NDS operation */
+    unsigned long long stat_nds_cache_hits;  /* Number of times we've been able to fulfill a
+                                              * key lookup from within memory */
+    unsigned long long stat_nds_cache_misses;  /* Number of times we've had to go to disk to
+                                                * fulfill a key lookup */
+    unsigned long long stat_nds_flush_success;  /* How many successful flushes we've done */
+    unsigned long long stat_nds_flush_failure;  /* How many flushes have failed */
+    unsigned long long stat_nds_usec;  /* How much time has been spent inside NDS */
+    NDSDB ndsdb;                    /* Global pointer to the open NDSDB */
     /* Pipe and data structures for child -> parent info sharing. */
     int child_info_pipe[2];         /* Pipe used to write the child_info_data. */
     int child_info_nread;           /* Num of bytes of the last read from pipe */
@@ -3250,6 +3293,8 @@ void dbAdd(redisDb *db, robj *key, robj *val);
 int dbAddRDBLoad(redisDb *db, sds key, robj *val);
 void dbReplaceValue(redisDb *db, robj *key, robj *val);
 
+int loadKey(redisDb *db, robj *key);
+int validKey(robj *key);
 #define SETKEY_KEEPTTL 1
 #define SETKEY_NO_SIGNAL 2
 #define SETKEY_ALREADY_EXIST 4
@@ -3285,6 +3330,15 @@ size_t lazyfreeGetFreedObjectsCount(void);
 void lazyfreeResetStats(void);
 void freeObjAsync(robj *key, robj *obj, int dbid);
 void freeReplicationBacklogRefMemAsync(list *blocks, rax *index);
+
+/* The blob we pass into functions that walk the keyspace for keysCommand */
+typedef struct {
+    client *c;
+    sds pattern;
+    int plen;
+    int allkeys;
+    int numkeys;
+} keysCommandWalkerData;
 
 /* API to get key arguments from commands */
 #define GET_KEYSPEC_DEFAULT 0
@@ -3618,6 +3672,7 @@ void migrateCommand(client *c);
 void askingCommand(client *c);
 void readonlyCommand(client *c);
 void readwriteCommand(client *c);
+void createDumpPayload(rio *payload, robj *o, robj *key, int dbid);
 int verifyDumpPayload(unsigned char *p, size_t len, uint16_t *rdbver_ptr);
 void dumpCommand(client *c);
 void objectCommand(client *c);

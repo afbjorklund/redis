@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "nds.h"
 #include "bio.h"
 #include "rio.h"
 #include "functions.h"
@@ -2455,6 +2456,7 @@ int rewriteAppendOnlyFileBackground(void) {
         return C_ERR;
     }
     server.stat_aof_rewrites++;
+    preforkNDS();
     if ((childpid = redisFork(CHILD_TYPE_AOF)) == 0) {
         char tmpfile[256];
 

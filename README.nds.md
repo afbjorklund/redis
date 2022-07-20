@@ -1,0 +1,169 @@
+Welcome to the Naive Disk Store.  It is an attempt to see if a really
+stupidly-simple disk-backed store has any hope of working with Redis.  The
+intended use case is for a redis instance that stores a lot of data, but
+with a relatively small active set of keys.
+
+NDS is implemented by persisting every change to a key to an on-disk
+database, through a periodic "flush" of all keys that have changed
+(controlled by the same logic as RDB dumps).  Every time a key isn't
+available in memory, the on-disk database is checked to see if the key
+exists.
+
+The concept is that you can keep memory usage of your redis instance under
+control by setting maxmemory (with an allkeys-lru eviction policy,
+preferably) and as memory is required, keys that haven't been recently used
+get evicted from memory.  When they're needed again in the future, however,
+they're available on disk.
+
+There are a few "side benefits" to using NDS.  They're not the reason it was
+written, but they're useful anyway.  Whether they're worth it for your
+use-case is up to you.
+
+* Very, very short "startup" time.  Instead of having to load a large RDB or
+  AOF into memory, the redis instance can immediately start serving
+  requests.  The performance will be poor until the popular keys are all
+  in-memory, but often slow operation is better than no operation.
+
+* Disk-efficient, near-real-time persistence.  Disk space usage isn't
+  significantly more than an RDB file, and you never have to trigger a
+  rewrite or a complete dump -- and yet, you still get up-to-date
+  persistence.
+
+Conversely, there are a few downsides:
+
+* Slow performance for a while after startup.  Until the keys you're working
+  on are in memory (either by preloading, or just through cache misses
+  pulling the important keys in), the first time each key accessed after
+  startup there is a hit to disk to go get the key.
+
+* If your "hot set" of keys is larger than the amount of memory you choose
+  to allow Redis to use, performance will suck.  This shouldn't be news to
+  anyone, though.  NDS is awesome, but it isn't magic.  You may just need to
+  give it more memory.
+
+
+DEPLOYING
+---------
+
+If you've checked out my git repo, you can just build it as normal.
+Otherwise, you'll have to patch whatever source tree you're using with the
+changes from my git repo.
+
+There are three new configuration parameters available:
+
+* `nds` -- set this to `yes` to enable NDS.  This will disable AOF and RDB
+  persistence (including reading those files at startup -- you will need to
+  replicate into NDS to get an existing dataset loaded).
+
+* `nds-preload` -- set this to `yes` to tell NDS to load all keys off disk
+  at startup.  This will slow down other clients considerably, although it
+  doesn't block other clients completely.  By enabling this option, you get
+  regular Redis performance (after the preload is complete), but with NDS'
+  persistence model.  You probably shouldn't enable this option if you're
+  trying to keep your memory usage under control.
+
+Once NDS is enabled, you want to change the value of the `save` parameter to
+something really, really low, because saving the changed keys to disk
+doesn't cost very much at all.  I use `5 1 1 5` usually, just because I like
+the symmetry, but `1 1` is equivalent to AOF's "fsync every second" mode,
+and `1 0` is more-or-less "write 'em out as quick as you can", although we
+don't guarantee that keys will be persistent on disk when the command
+completes.
+
+
+There are also a few options you want to tweak, if you want to use NDS for
+its ability to maintain only a subset of keys in memory:
+
+* `maxmemory` -- assuming you want to use NDS to keep your redis memory
+  usage under control, set `maxmemory` to whatever you want to keep your
+  memory usage to.  You could just use NDS for quick startup and frequent,
+  IO-efficient persistence, in which case you can leave `maxmemory` alone.
+
+* `maxmemory-policy` -- you want to set this to `allkeys-lru`, to ensure
+  that the most frequently used keys are kept in memory and the least-used
+  keys end up living on disk.
+
+* `maxmemory-samples` -- Bumping this up somewhat will help to select
+  "better" keys for eviction.  I use `15` here, and it doesn't appear to
+  kill performance badly.
+
+* `save` -- set this nice and low, because a flush doesn't cost much.  You
+  could go with `1 1` to flush all changes every second.  I use `5 1 1 5` by
+  default, because I like the symmetry.
+
+To fill your NDS redis instance from an existing dataset, you need to
+replicate your data from another redis instance.  By firing up your NDS
+redis on a local address/port, replicating from the existing "live" redis,
+then killing the live redis, changing the NDS redis config to use the live
+address/port/socket/whatever, and then starting it again, you can get the
+cutover downtime to a few seconds if you script it.
+
+
+MANAGEMENT
+----------
+
+There are a few commands that have been added to the redis command set:
+
+* `NDS FLUSH` -- Use this if you wish to trigger a manual flush of all keys
+  (I can't imagine why you'd need to, but it's there if you want it).
+
+* `NDS SNAPSHOT` -- Take a copy of all of the NDS data files, so you can get
+  consistent disk backups of all your redis data.  The snapshot will be
+  stored in a directory underneath your Redis data directory named,
+  unimaginatively enough, "snapshot".
+
+* `NDS CLEARSTATS` -- If you want to nuke the cache hit/miss numbers, this
+  is how to do it.
+
+* `NDS PRELOAD` -- Trigger a "manual" preload.  This is useful if you want
+  to suddenly get everything into memory, but didn't have it set in the
+  config file.
+
+There is also a new section in the `INFO` output, for NDS statistics.  It'll
+show up when you run `INFO`, and can be produced on its own with `INFO NDS`.
+
+If you want to move away from NDS, here is the simplest way:
+
+* Disable all access to the Redis instance.
+
+* `SAVE` -- this will create a `dump.rdb` file.
+
+* `SHUTDOWN` -- stop Redis.
+
+* Disable NDS in the config file by setting `nds no`.
+
+* Start Redis again.  Since NDS is now disabled, Redis will read all data
+  into memory from the `dump.rdb` file.
+
+You can reduce the amount of downtime by using AOF instead of RDB, too.
+
+
+TODO
+----
+
+NDS is very new, and shouldn't be relied upon for anything really important.
+There may be some pretty serious bugs in the code that haven't been found
+yet.  If you're not comfortable digging into the code to find the bug and
+submit a patch, you *probably* don't want to be deploying this thing right
+now.
+
+Here are the list of things that are known deficiencies in the code, as
+compared to "stock" Redis:
+
+* Keys can be no longer than 511 octets in length.  This is a limitation in
+  MDB, and isn't something that can be easily extended.  At present, keys
+  longer than this limit will be stored in memory and can be manipulated,
+  but won't be persisted to disk and hence will be lost across a restart.
+  I'd like for Redis to return an error on an attempt to manipulate such a
+  long key, but it isn't trivial.
+
+And here are features that might be useful to implement, but aren't bugs as
+such:
+
+* An `nds-sync` mode would be cute (but slow as molasses) -- instead of
+  forking children to write dirty keys to disk, instead write the change to
+  disk immediately.  Ouch.  An alternative would be to use an AOF-style journal
+  (probably with fsync=immediate) to keep a record of those changes that
+  haven't get been flushed to disk (although this would need to set keys,
+  rather than (say) increment them, to avoid problems when a key got written
+  to disk but the flush didn't *complete*).

@@ -537,6 +537,11 @@ void setbitCommand(client *c) {
     int byteval, bitval;
     long on;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if (getBitOffsetFromArgument(c,c->argv[2],&bitoffset,0,0) != C_OK)
         return;
 
@@ -583,6 +588,11 @@ void getbitCommand(client *c) {
     size_t byte, bit;
     size_t bitval = 0;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if (getBitOffsetFromArgument(c,c->argv[2],&bitoffset,0,0) != C_OK)
         return;
 
@@ -614,6 +624,13 @@ void bitopCommand(client *c) {
                                        and max len. */
     unsigned long minlen = 0;    /* Min len among the input keys. */
     unsigned char *res = NULL; /* Resulting string. */
+
+    for (int j = 1; j < c->argc; j++) {
+        if (validKey(c->argv[j]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
+    }
 
     /* Parse the operation name. */
     if ((opname[0] == 'a' || opname[0] == 'A') && !strcasecmp(opname,"and"))
@@ -801,6 +818,11 @@ void bitcountCommand(client *c) {
     char llbuf[LONG_STR_SIZE];
     int isbit = 0;
     unsigned char first_byte_neg_mask = 0, last_byte_neg_mask = 0;
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
 
     /* Lookup, check for type, and return 0 for non existing keys. */
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||

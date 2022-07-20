@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "nds.h"
 #include "monotonic.h"
 #include "cluster.h"
 #include "slowlog.h"
@@ -650,6 +651,7 @@ const char *strChildType(int type) {
         case CHILD_TYPE_AOF: return "AOF";
         case CHILD_TYPE_LDB: return "LDB";
         case CHILD_TYPE_MODULE: return "MODULE";
+        case CHILD_TYPE_NDS: return "NDS";
         default: return "Unknown";
     }
 }
@@ -678,7 +680,7 @@ void resetChildState(void) {
 
 /* Return if child type is mutually exclusive with other fork children */
 int isMutuallyExclusiveChildType(int type) {
-    return type == CHILD_TYPE_RDB || type == CHILD_TYPE_AOF || type == CHILD_TYPE_MODULE;
+    return type == CHILD_TYPE_RDB || type == CHILD_TYPE_AOF || type == CHILD_TYPE_MODULE || type == CHILD_TYPE_NDS;
 }
 
 /* Returns true when we're inside a long command that yielded to the event loop. */
@@ -1184,6 +1186,8 @@ void checkChildrenDone(void) {
                 backgroundRewriteDoneHandler(exitcode, bysignal);
             } else if (server.child_type == CHILD_TYPE_MODULE) {
                 ModuleForkDoneHandler(exitcode, bysignal);
+            } else if (server.child_type == CHILD_TYPE_NDS) {
+                 backgroundNDSFlushDoneHandler(exitcode,bysignal);
             } else {
                 serverPanic("Unknown child type %d for child pid %d", server.child_type, server.child_pid);
                 exit(1);
@@ -1408,9 +1412,14 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             {
                 serverLog(LL_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, (int)sp->seconds);
-                rdbSaveInfo rsi, *rsiptr;
-                rsiptr = rdbPopulateSaveInfo(&rsi);
-                rdbSaveBackground(SLAVE_REQ_NONE,server.rdb_filename,rsiptr,RDBFLAGS_NONE);
+                /* RDB periodic dumps are redundant if we've got NDS */
+                if (server.nds) {
+                    backgroundDirtyKeysFlush();
+                } else {
+                    rdbSaveInfo rsi, *rsiptr;
+                    rsiptr = rdbPopulateSaveInfo(&rsi);
+                    rdbSaveBackground(SLAVE_REQ_NONE,server.rdb_filename,rsiptr,RDBFLAGS_NONE);
+                }
                 break;
             }
         }
@@ -1449,7 +1458,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * a higher frequency. */
     run_with_period(1000) {
         if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
-            server.aof_last_write_status == C_ERR) 
+            server.aof_last_write_status == C_ERR)
             {
                 flushAppendOnlyFile(0);
             }
@@ -1459,8 +1468,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     updatePausedActions();
 
     /* Replication cron function -- used to reconnect to master,
-     * detect transfer failures, start background RDB transfers and so forth. 
-     * 
+     * detect transfer failures, start background RDB transfers and so forth.
+     *
      * If Redis is trying to failover then run the replication cron faster so
      * progress on the handshake happens more quickly. */
     if (server.failover_state != NO_FAILOVER) {
@@ -1687,7 +1696,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * processUnblockedClients(), so if there are multiple pipelined WAITs
      * and the just unblocked WAIT gets blocked again, we don't have to wait
      * a server cron cycle in absence of other event loop events. See #6623.
-     * 
+     *
      * We also don't send the ACKs while clients are paused, since it can
      * increment the replication backlog, they'll be sent after the pause
      * if we are still the master. */
@@ -1697,7 +1706,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* We may have received updates from clients about their current offset. NOTE:
-     * this can't be done where the ACK is received since failover will disconnect 
+     * this can't be done where the ACK is received since failover will disconnect
      * our clients. */
     updateFailoverStatus();
 
@@ -1840,6 +1849,8 @@ void createSharedObjects(void) {
     shared.err = createObject(OBJ_STRING,sdsnew("-ERR\r\n"));
     shared.nokeyerr = createObject(OBJ_STRING,sdsnew(
         "-ERR no such key\r\n"));
+    shared.invalidkeyerr = createObject(OBJ_STRING,sdsnew(
+        "-ERR invalid key name\r\n"));
     shared.syntaxerr = createObject(OBJ_STRING,sdsnew(
         "-ERR syntax error\r\n"));
     shared.sameobjecterr = createObject(OBJ_STRING,sdsnew(
@@ -2049,6 +2060,10 @@ void initServerConfig(void) {
     server.aof_flush_postponed_start = 0;
     server.aof_last_incr_size = 0;
     server.aof_last_incr_fsync_offset = 0;
+    server.nds = 0;
+    server.nds_watermark = 0;
+    server.nds_preload = 0;
+    server.nds_keycache = 0;
     server.active_defrag_running = 0;
     server.notify_keyspace_events = 0;
     server.blocked_clients = 0;
@@ -2637,6 +2652,9 @@ void initServer(void) {
         server.db[j].blocking_keys_unblock_on_nokey = dictCreate(&objectKeyPointerValueDictType);
         server.db[j].ready_keys = dictCreate(&objectKeyPointerValueDictType);
         server.db[j].watched_keys = dictCreate(&keylistDictType);
+        server.db[j].dirty_keys = dictCreate(&dbDictType);
+        server.db[j].flushing_keys = dictCreate(&dbDictType);
+        server.db[j].nds_keys = dictCreate(&dbDictType);
         server.db[j].id = j;
         server.db[j].avg_ttl = 0;
         server.db[j].defrag_later = listCreate();
@@ -2664,6 +2682,12 @@ void initServer(void) {
     server.child_info_pipe[0] = -1;
     server.child_info_pipe[1] = -1;
     server.child_info_nread = 0;
+    server.nds_preload_in_progress = 0;
+    server.nds_preload_complete = 0;
+    server.nds_snapshot_pending = 0;
+    server.nds_snapshot_in_progress = 0;
+    server.nds_bg_requestor = NULL;
+    memset(&server.ndsdb, 0,sizeof(server.ndsdb));
     server.aof_buf = sdsempty();
     server.lastsave = time(NULL); /* At startup we consider the DB saved. */
     server.lastbgsave_try = 0;    /* At startup we never tried to BGSAVE. */
@@ -2672,6 +2696,11 @@ void initServer(void) {
     server.rdb_last_load_keys_expired = 0;
     server.rdb_last_load_keys_loaded = 0;
     server.dirty = 0;
+    server.stat_nds_cache_hits = 0;
+    server.stat_nds_cache_misses = 0;
+    server.stat_nds_flush_success = 0;
+    server.stat_nds_flush_failure = 0;
+    server.stat_nds_usec = 0;
     resetServerStats();
     /* A few stats we don't want to reset: server startup time, and peak mem. */
     server.stat_starttime = time(NULL);
@@ -4001,6 +4030,7 @@ int processCommand(client *c) {
         }
 
         if (out_of_memory && reject_cmd_on_oom) {
+            serverLog(LL_WARNING, "Command denied due to OOM");
             rejectCommand(c, shared.oomerr);
             return C_OK;
         }
@@ -4139,6 +4169,7 @@ int processCommand(client *c) {
         ((isPausedActions(PAUSE_ACTION_CLIENT_ALL)) ||
         ((isPausedActions(PAUSE_ACTION_CLIENT_WRITE)) && is_may_replicate_command)))
     {
+        c->bstate.timeout = 0;
         blockPostponeClient(c);
         return C_OK;       
     }
@@ -4394,28 +4425,33 @@ int finishShutdown(void) {
         }
     }
 
-    /* Create a new RDB file before exiting. */
-    if ((server.saveparamslen > 0 && !nosave) || save) {
-        serverLog(LL_NOTICE,"Saving the final RDB snapshot before exiting.");
-        if (server.supervised_mode == SUPERVISED_SYSTEMD)
-            redisCommunicateSystemd("STATUS=Saving the final RDB snapshot\n");
-        /* Snapshotting. Perform a SYNC SAVE and exit */
-        rdbSaveInfo rsi, *rsiptr;
-        rsiptr = rdbPopulateSaveInfo(&rsi);
-        /* Keep the page cache since it's likely to restart soon */
-        if (rdbSave(SLAVE_REQ_NONE,server.rdb_filename,rsiptr,RDBFLAGS_KEEP_CACHE) != C_OK) {
-            /* Ooops.. error saving! The best we can do is to continue
-             * operating. Note that if there was a background saving process,
-             * in the next cron() Redis will be notified that the background
-             * saving aborted, handling special stuff like slaves pending for
-             * synchronization... */
-            if (force) {
-                serverLog(LL_WARNING,"Error trying to save the DB. Exit anyway.");
-            } else {
-                serverLog(LL_WARNING,"Error trying to save the DB, can't exit.");
-                if (server.supervised_mode == SUPERVISED_SYSTEMD)
-                    redisCommunicateSystemd("STATUS=Error trying to save the DB, can't exit.\n");
-                goto error;
+    if (server.nds) {
+        serverLog(LL_NOTICE, "Flushing dirty keys to NDS before exiting.");
+        flushDirtyKeys();
+    } else {
+        /* Create a new RDB file before exiting. */
+        if ((server.saveparamslen > 0 && !nosave) || save) {
+            serverLog(LL_NOTICE,"Saving the final RDB snapshot before exiting.");
+            if (server.supervised_mode == SUPERVISED_SYSTEMD)
+                redisCommunicateSystemd("STATUS=Saving the final RDB snapshot\n");
+            /* Snapshotting. Perform a SYNC SAVE and exit */
+            rdbSaveInfo rsi, *rsiptr;
+            rsiptr = rdbPopulateSaveInfo(&rsi);
+            /* Keep the page cache since it's likely to restart soon */
+            if (rdbSave(SLAVE_REQ_NONE,server.rdb_filename,rsiptr,RDBFLAGS_KEEP_CACHE) != C_OK) {
+                /* Ooops.. error saving! The best we can do is to continue
+                 * operating. Note that if there was a background saving process,
+                 * in the next cron() Redis will be notified that the background
+                 * saving aborted, handling special stuff like slaves pending for
+                 * synchronization... */
+                if (force) {
+                    serverLog(LL_WARNING,"Error trying to save the DB. Exit anyway.");
+                } else {
+                    serverLog(LL_WARNING,"Error trying to save the DB, can't exit.");
+                    if (server.supervised_mode == SUPERVISED_SYSTEMD)
+                        redisCommunicateSystemd("STATUS=Error trying to save the DB, can't exit.\n");
+                    goto error;
+                }
             }
         }
     }
@@ -6211,6 +6247,8 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
 
     /* Key space */
     if (all_sections || (dictFind(section_dict,"keyspace") != NULL)) {
+        size_t ndskeys = 0;
+
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info, "# Keyspace\r\n");
         for (j = 0; j < server.dbnum; j++) {
@@ -6218,12 +6256,68 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
 
             keys = dictSize(server.db[j].dict);
             vkeys = dictSize(server.db[j].expires);
-            if (keys || vkeys) {
+            if (server.nds) {
+                ndskeys = keyCountNDS(server.db+j);
+            }
+
+            if (keys || vkeys || ndskeys) {
+                char ndskeystr[1024] = "";
+
+                if (server.nds) {
+                    snprintf(ndskeystr, 1023, ",nds=%lu", ndskeys);
+                }
                 info = sdscatprintf(info,
                     "db%d:keys=%lld,expires=%lld,avg_ttl=%lld\r\n",
                     j, keys, vkeys, server.db[j].avg_ttl);
             }
         }
+    }
+
+    /* NDS */
+    if (server.nds && (all_sections || (dictFind(section_dict,"nds") != NULL))) {
+        double hit_rate;
+
+        if (server.stat_nds_cache_hits == 0 && server.stat_nds_cache_misses == 0) {
+            hit_rate = -1;
+        } else {
+            hit_rate = 100.0 * (double)server.stat_nds_cache_hits /
+                        (server.stat_nds_cache_hits + server.stat_nds_cache_misses);
+        }
+
+        if (sections++) info = sdscat(info,"\r\n");
+        info = sdscatprintf(info,
+            "# NDS\r\n"
+            "nds_enabled:%i\r\n"
+            "nds_preload:%i\r\n"
+            "nds_keycache:%i\r\n"
+            "nds_cache_hits:%llu\r\n"
+            "nds_cache_misses:%llu\r\n"
+            "nds_cache_hit_rate:%.02f%%\r\n"
+            "nds_usec:%llu\r\n"
+            "nds_dirty_keys:%llu\r\n"
+            "nds_flushing_keys:%llu\r\n"
+            "nds_flush_success:%llu\r\n"
+            "nds_flush_failure:%llu\r\n"
+            "nds_preload_in_progress:%i\r\n"
+            "nds_preload_complete:%i\r\n"
+            "nds_snapshot_pending:%i\r\n"
+            "nds_snapshot_in_progress:%i\r\n",
+            server.nds,
+            server.nds_preload,
+            server.nds_keycache,
+            server.stat_nds_cache_hits,
+            server.stat_nds_cache_misses,
+            hit_rate,
+            server.stat_nds_usec,
+            dirtyKeyCount(),
+            flushingKeyCount(),
+            server.stat_nds_flush_success,
+            server.stat_nds_flush_failure,
+            server.nds_preload_in_progress,
+            server.nds_preload_complete,
+            server.nds_snapshot_pending,
+            server.nds_snapshot_in_progress
+        );
     }
 
     /* Get info from modules.
@@ -6759,6 +6853,17 @@ int checkForSentinelMode(int argc, char **argv, char *exec_name) {
 
 /* Function called at startup to load RDB or AOF file in memory. */
 void loadDataFromDisk(void) {
+    if (server.nds) {
+        serverLog(LL_NOTICE, "Using data from NDS");
+        if (server.nds_preload) {
+            serverLog(LL_NOTICE, "Preloading all NDS data");
+            preloadNDS();
+        }
+        if (server.nds_keycache) {
+            serverLog(LL_NOTICE, "Caching all NDS keys in memory");
+            loadNDSKeycache();
+        }
+    } else {
     long long start = ustime();
     if (server.aof_state == AOF_ON) {
         int ret = loadAppendOnlyFiles(server.aof_manifest);
@@ -6812,8 +6917,11 @@ void loadDataFromDisk(void) {
                               server.repl_backlog->histlen + 1;
                     rebaseReplicationBuffer(rsi.repl_offset);
                     server.repl_no_slaves_since = time(NULL);
+                    }
                 }
-            }
+	} else if (errno != ENOENT) {
+                serverLog(LL_WARNING,"Fatal error loading the DB: %s. Exiting.",strerror(errno));
+                exit(1);
         } else if (rdb_load_ret != RDB_NOT_EXIST) {
             serverLog(LL_WARNING, "Fatal error loading the DB, check server logs. Exiting.");
             exit(1);
@@ -6826,6 +6934,7 @@ void loadDataFromDisk(void) {
          * of replication backlog, we drop it. */
         if (!rsi_is_valid && server.repl_backlog)
             freeReplicationBacklog();
+        }
     }
 }
 

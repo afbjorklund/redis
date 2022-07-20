@@ -86,6 +86,11 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
     int found = 0;
     int setkey_flags = 0;
 
+    if (validKey(key) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if (expire && getExpireMillisecondsOrReply(c, expire, flags, unit, &milliseconds) != C_OK) {
         return;
     }
@@ -323,6 +328,11 @@ void psetexCommand(client *c) {
 int getGenericCommand(client *c) {
     robj *o;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return C_ERR;
+    }
+
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp])) == NULL)
         return C_OK;
 
@@ -444,6 +454,11 @@ void setrangeCommand(client *c) {
     long offset;
     sds value = c->argv[3]->ptr;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if (getLongFromObjectOrReply(c,c->argv[2],&offset,NULL) != C_OK)
         return;
 
@@ -505,6 +520,11 @@ void getrangeCommand(client *c) {
     char *str, llbuf[32];
     size_t strlen;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if (getLongLongFromObjectOrReply(c,c->argv[2],&start,NULL) != C_OK)
         return;
     if (getLongLongFromObjectOrReply(c,c->argv[3],&end,NULL) != C_OK)
@@ -543,6 +563,13 @@ void getrangeCommand(client *c) {
 void mgetCommand(client *c) {
     int j;
 
+    for (j = 1; j < c->argc; j++) {
+        if (validKey(c->argv[1]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
+    }
+
     addReplyArrayLen(c,c->argc-1);
     for (j = 1; j < c->argc; j++) {
         robj *o = lookupKeyRead(c->db,c->argv[j]);
@@ -570,6 +597,10 @@ void msetGenericCommand(client *c, int nx) {
      * set anything if at least one key already exists. */
     if (nx) {
         for (j = 1; j < c->argc; j += 2) {
+            if (validKey(c->argv[j]) == C_ERR) {
+                addReplyErrorObject(c,shared.invalidkeyerr);
+                return;
+            }
             if (lookupKeyWrite(c->db,c->argv[j]) != NULL) {
                 addReply(c, shared.czero);
                 return;
@@ -579,6 +610,10 @@ void msetGenericCommand(client *c, int nx) {
 
     int setkey_flags = nx ? SETKEY_DOESNT_EXIST : 0;
     for (j = 1; j < c->argc; j += 2) {
+        if (validKey(c->argv[j]) == C_ERR) {
+            addReplyErrorObject(c,shared.invalidkeyerr);
+            return;
+        }
         c->argv[j+1] = tryObjectEncoding(c->argv[j+1]);
         setKey(c, c->db, c->argv[j], c->argv[j + 1], setkey_flags);
         notifyKeyspaceEvent(NOTIFY_STRING,"set",c->argv[j],c->db->id);
@@ -601,6 +636,11 @@ void msetnxCommand(client *c) {
 void incrDecrCommand(client *c, long long incr) {
     long long value, oldvalue;
     robj *o, *new;
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
 
     o = lookupKeyWrite(c->db,c->argv[1]);
     if (checkType(c,o,OBJ_STRING)) return;
@@ -665,6 +705,11 @@ void incrbyfloatCommand(client *c) {
     long double incr, value;
     robj *o, *new;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     o = lookupKeyWrite(c->db,c->argv[1]);
     if (checkType(c,o,OBJ_STRING)) return;
     if (getLongDoubleFromObjectOrReply(c,o,&value,NULL) != C_OK ||
@@ -698,6 +743,11 @@ void appendCommand(client *c) {
     size_t totlen;
     robj *o, *append;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     o = lookupKeyWrite(c->db,c->argv[1]);
     if (o == NULL) {
         /* Create the key */
@@ -728,6 +778,12 @@ void appendCommand(client *c) {
 
 void strlenCommand(client *c) {
     robj *o;
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
         checkType(c,o,OBJ_STRING)) return;
     addReplyLongLong(c,stringObjectLen(o));

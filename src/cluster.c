@@ -6551,6 +6551,11 @@ void dumpCommand(client *c) {
     robj *o;
     rio payload;
 
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
+    }
+
     /* Check if the key is here. */
     if ((o = lookupKeyRead(c->db,c->argv[1])) == NULL) {
         addReplyNull(c);
@@ -6604,6 +6609,11 @@ void restoreCommand(client *c) {
             addReplyErrorObject(c,shared.syntaxerr);
             return;
         }
+    }
+
+    if (validKey(c->argv[1]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
     }
 
     /* Make sure this key does not already exist here... */
@@ -6847,6 +6857,11 @@ void migrateCommand(client *c) {
             addReplyErrorObject(c,shared.syntaxerr);
             return;
         }
+    }
+
+    if (validKey(c->argv[3]) == C_ERR) {
+        addReplyErrorObject(c,shared.invalidkeyerr);
+        return;
     }
 
     /* Sanity check */
